@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mini-Foglio di Calcolo</title>
+<meta name="theme-color" content="#198754">
+<!-- Bootstrap (richiesto dalla prova) -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+<style>
+  html,body{height:100%;margin:0}
+  body{display:flex;flex-direction:column;height:100dvh;font-family:system-ui,sans-serif;font-size:14px}
+  #bar{flex:none}
+  #wrap{flex:1;min-height:0;display:grid;grid-template-columns:44px 1fr;grid-template-rows:26px 1fr}
+  .hd{background:#f1f3f5;overflow:hidden;position:relative;user-select:none}
+  #colh,#rowh{position:relative}
+  .h{position:absolute;box-sizing:border-box;border:1px solid #ced4da;text-align:center;font-weight:600;color:#495057;line-height:25px}
+  .h.on{background:#b7e4c7;color:#0b5132}
+  #sc{overflow:auto;position:relative;outline:none;background:#fff;-webkit-overflow-scrolling:touch}
+  #sizer{position:relative}
+  .c{position:absolute;box-sizing:border-box;border:1px solid #e3e6ea;padding:0 4px;line-height:25px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .c.n{text-align:right}
+  .c.e{color:#c92a2a;font-weight:600}
+  .c.s{outline:2px solid #198754;outline-offset:-2px;background:#e9f7ef;z-index:2}
+  #ed{position:absolute;display:none;box-sizing:border-box;border:2px solid #198754;z-index:5;padding:0 4px;font:inherit}
+</style>
+</head>
+<body>
+<div id="bar" class="d-flex flex-wrap gap-2 align-items-center p-2 bg-success-subtle border-bottom">
+  <strong class="me-1">Mini-Foglio</strong>
+  <span id="addr" class="badge text-bg-success" style="min-width:48px">A1</span>
+  <input id="fx" class="form-control form-control-sm flex-grow-1" style="min-width:140px;flex-basis:200px" placeholder="Barra della formula (es. =SOMMA(A1:A5))">
+  <span id="msg" class="text-danger small fw-semibold"></span>
+  <button id="demo" class="btn btn-sm btn-outline-success">Esempi</button>
+  <button id="clear" class="btn btn-sm btn-outline-danger">Svuota</button>
+  <button id="inst" class="btn btn-sm btn-success" style="display:none">Installa</button>
+</div>
+<div id="wrap">
+  <div class="hd"></div>
+  <div class="hd"><div id="colh"></div></div>
+  <div class="hd"><div id="rowh"></div></div>
+  <div id="sc" tabindex="0"><div id="sizer"><div id="cells"></div><input id="ed" autocomplete="off"></div></div>
+</div>
+
+<script>
+/* ============ 1. COORDINATE (A1 <-> indici) ============ */
+const ROWS = 100, COLS = 100, W = 90, H = 26;
+function colName(n){ let s=''; n++; while(n>0){ const m=(n-1)%26; s=String.fromCharCode(65+m)+s; n=Math.floor((n-1)/26);} return s; } // 0 -> A, 99 -> CV
+function colIndex(s){ let n=0; for(const ch of s) n=n*26+ch.charCodeAt(0)-64; return n-1; }
+const key = (r,c) => colName(c)+(r+1);
+
+/* ============ 2. MOTORE DI CALCOLO ============ */
+class Err { constructor(c){ this.c=c; } }
+const ERR_MSG = {'#DIV/0!':'Divisione per zero','#VALORE!':'Valore non valido','#RIF!':'Riferimento fuori griglia','#NOME?':'Nome di funzione sconosciuto','#CIRC!':'Riferimento circolare'};
+let cells = {};          // contenuto grezzo: { "A1": "=SOMMA(B1:B3)" }
+let cache = new Map();   // valori calcolati (memoizzazione)
+let stack = new Set();   // celle in calcolo -> serve per i riferimenti circolari
+
+const isNum = x => typeof x==='string' ? (x.trim()!=='' && !isNaN(x)) : typeof x==='number';
+
+// Valore di una cella (calcolato solo se serve e salvato in cache)
+function val(k){
+  if(cache.has(k)) return cache.get(k);
+  const raw = cells[k]; let v;
+  if(raw===undefined || raw==='') v='';
+  else if(raw[0]==='='){
+    if(stack.has(k)) return new Err('#CIRC!');        // siamo già dentro questa cella: ciclo
+    stack.add(k);
+    try{ v = evalFormula(raw.slice(1)); if(Array.isArray(v)) v=new Err('#VALORE!'); }
+    catch(e){ v = e instanceof Err ? e : new Err('#VALORE!'); }
+    stack.delete(k);
+  } else v = isNum(raw) ? Number(raw) : raw;
+  cache.set(k,v); return v;
+}
+
+// Tokenizer: spezzetta la formula in numeri, stringhe, intervalli, celle, nomi, operatori
+function tokenize(s){
+  const re=/\s*(?:(\d+\.?\d*)|"([^"]*)"|([A-Za-z]+\d+:[A-Za-z]+\d+)|([A-Za-z]+\d+)|([A-Za-z][A-Za-z.]*)|([-+*\/();,]))/y;
+  const t=[]; let m; re.lastIndex=0;
+  while(re.lastIndex<s.length && s.slice(re.lastIndex).trim()!==''){
+    m=re.exec(s); if(!m) throw new Err('#VALORE!');
+    if(m[1]!==undefined) t.push({t:'num',v:Number(m[1])});
+    else if(m[2]!==undefined) t.push({t:'str',v:m[2]});
+    else if(m[3]) t.push({t:'rng',v:m[3].toUpperCase()});
+    else if(m[4]) t.push({t:'ref',v:m[4].toUpperCase()});
+    else if(m[5]) t.push({t:'name',v:m[5].toUpperCase()});
+    else t.push({t:'op',v:m[6]});
+  }
+  return t;
+}
+function toRC(ref){ // "B3" -> [riga, colonna] oppure #RIF!
+  const m=/^([A-Z]+)(\d+)$/.exec(ref); const c=colIndex(m[1]), r=+m[2]-1;
+  if(c<0||c>=COLS||r<0||r>=ROWS) throw new Err('#RIF!');
+  return [r,c];
+}
+function num(v){ // converte in numero per le operazioni aritmetiche
+  if(v instanceof Err) throw v;
+  if(Array.isArray(v)) throw new Err('#VALORE!');
+  if(v==='') return 0;
+  if(isNum(v)) return Number(v);
+  throw new Err('#VALORE!');
+}
+
+// Criteri per SOMMA.SE / CONTA.SE / MEDIA.SE: ">5", "<=3", "<>x", "testo"
+function makeCrit(c){
+  const s=String(c), m=/^(<=|>=|<>|<|>|=)?(.*)$/.exec(s), op=m[1]||'=', t=m[2];
+  const tn = isNum(t) ? Number(t) : null;
+  const cmp=(a,b)=>op==='='?a===b:op==='<>'?a!==b:op==='<'?a<b:op==='>'?a>b:op==='<='?a<=b:a>=b;
+  return x=>{
+    if(x instanceof Err) return false;
+    if(tn!==null) return isNum(x) && x!=='' ? cmp(Number(x),tn) : op==='<>';
+    return cmp(String(x).toLowerCase(), t.toLowerCase());
+  };
+}
+
+// Parser ricorsivo con precedenza: expr (+ -) > term (* /) > unario > primario
+function evalFormula(src){
+  const tk=tokenize(src); let p=0;
+  const peek=()=>tk[p], isOp=o=>tk[p]&&tk[p].t==='op'&&tk[p].v===o;
+  function expr(){ let a=term(); while(isOp('+')||isOp('-')){ const o=tk[p++].v; const b=term(); a = o==='+'?num(a)+num(b):num(a)-num(b);} return a; }
+  function term(){ let a=unary(); while(isOp('*')||isOp('/')){ const o=tk[p++].v; const b=unary();
+      if(o==='*') a=num(a)*num(b); else { const d=num(b); if(d===0) throw new Err('#DIV/0!'); a=num(a)/d; } } return a; }
+  function unary(){ if(isOp('-')){ p++; return -num(unary()); } if(isOp('+')){ p++; return num(unary()); } return primary(); }
+  function primary(){
+    const t=tk[p++]; if(!t) throw new Err('#VALORE!');
+    if(t.t==='num'||t.t==='str') return t.v;
+    if(t.t==='ref'){ const [r,c]=toRC(t.v); const v=val(key(r,c)); if(v instanceof Err) throw v; return v; }
+    if(t.t==='rng'){ // intervallo -> array di valori
+      const [a,b]=t.v.split(':'), [r1,c1]=toRC(a), [r2,c2]=toRC(b), out=[];
+      for(let r=Math.min(r1,r2);r<=Math.max(r1,r2);r++) for(let c=Math.min(c1,c2);c<=Math.max(c1,c2);c++){
+        const v=val(key(r,c)); if(v instanceof Err) throw v; out.push(v); }
+      return out;
+    }
+    if(t.t==='op'&&t.v==='('){ const v=expr(); if(!isOp(')')) throw new Err('#VALORE!'); p++; return v; }
+    if(t.t==='name'){
+      if(!isOp('(')) throw new Err('#NOME?');
+      p++; const args=[];
+      if(!isOp(')')){ args.push(expr()); while(isOp(';')||isOp(',')){ p++; args.push(expr()); } }
+      if(!isOp(')')) throw new Err('#VALORE!'); p++;
+      return callFn(t.v,args);
+    }
+    throw new Err('#VALORE!');
+  }
+  const res=expr(); if(p<tk.length) throw new Err('#VALORE!'); return res;
+}
+
+function callFn(name,args){
+  // numeri da un elenco di argomenti: negli intervalli contano solo i numeri
+  const nums=a=>{ const o=[]; for(const x of a){ if(Array.isArray(x)){ for(const y of x) if(typeof y==='number') o.push(y); } else o.push(num(x)); } return o; };
+  const rng=x=>Array.isArray(x)?x:[x];
+  const sum=a=>a.reduce((s,x)=>s+x,0);
+  switch(name){
+    case 'SOMMA': return sum(nums(args));
+    case 'MEDIA': { const n=nums(args); if(!n.length) throw new Err('#DIV/0!'); return sum(n)/n.length; }
+    case 'CONTA': return nums(args.map(a=>Array.isArray(a)?a:[a])).length;
+    case 'CONTA.VALORI': return args.flatMap(rng).filter(x=>x!=='').length;
+    case 'MAX': { const n=nums(args); return n.length?Math.max(...n):0; }
+    case 'MIN': { const n=nums(args); return n.length?Math.min(...n):0; }
+    case 'SOMMA.SE': case 'CONTA.SE': case 'MEDIA.SE': {
+      if(args.length<2) throw new Err('#VALORE!');
+      const r=rng(args[0]), f=makeCrit(args[1]), sr=args[2]?rng(args[2]):r, hit=[];
+      r.forEach((x,i)=>{ if(f(x) && typeof sr[i]==='number') hit.push(sr[i]); });
+      if(name==='CONTA.SE') return r.filter(f).length;
+      if(name==='SOMMA.SE') return sum(hit);
+      if(!hit.length) throw new Err('#DIV/0!'); return sum(hit)/hit.length;
+    }
+  }
+  throw new Err('#NOME?');
+}
+
+/* ============ 3. INTERFACCIA ============ */
+const $=id=>document.getElementById(id);
+const sc=$('sc'), cellsEl=$('cells'), ed=$('ed'), fx=$('fx');
+let sel=[0,0], editing=false;
+$('sizer').style.width=COLS*W+'px'; $('sizer').style.height=ROWS*H+'px';
+
+function show(v){ if(v instanceof Err) return v.c; if(typeof v==='number') return String(Number(v.toPrecision(12))); return v; }
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+/* VIRTUALIZZAZIONE: si disegnano solo le celle visibili nel viewport (~30x15),
+   non le 10.000. Lo scroller ha un "sizer" grande come l'intera griglia,
+   e le celle visibili sono posizionate in modo assoluto. */
+function render(){
+  const top=sc.scrollTop, left=sc.scrollLeft;
+  const r0=Math.max(0,Math.floor(top/H)), r1=Math.min(ROWS-1,r0+Math.ceil(sc.clientHeight/H)+1);
+  const c0=Math.max(0,Math.floor(left/W)), c1=Math.min(COLS-1,c0+Math.ceil(sc.clientWidth/W)+1);
+  let h='', ch='', rh='';
+  for(let r=r0;r<=r1;r++) for(let c=c0;c<=c1;c++){
+    const k=key(r,c), v=val(k), cls=['c'];
+    if(v instanceof Err) cls.push('e'); else if(typeof v==='number') cls.push('n');
+    if(r===sel[0]&&c===sel[1]) cls.push('s');
+    h+=`<div class="${cls.join(' ')}" data-r="${r}" data-c="${c}" style="left:${c*W}px;top:${r*H}px;width:${W}px;height:${H}px">${esc(show(v))}</div>`;
+  }
+  for(let c=c0;c<=c1;c++) ch+=`<div class="h${c===sel[1]?' on':''}" style="left:${c*W-left}px;width:${W}px;height:26px">${colName(c)}</div>`;
+  for(let r=r0;r<=r1;r++) rh+=`<div class="h${r===sel[0]?' on':''}" style="top:${r*H-top}px;width:44px;height:${H}px">${r+1}</div>`;
+  cellsEl.innerHTML=h; $('colh').innerHTML=ch; $('rowh').innerHTML=rh;
+}
+let raf=0; const schedule=()=>{ cancelAnimationFrame(raf); raf=requestAnimationFrame(render); };
+sc.addEventListener('scroll',schedule); window.addEventListener('resize',schedule);
+
+function updateBar(){
+  const k=key(...sel), v=val(k);
+  $('addr').textContent=k; fx.value=cells[k]||'';
+  $('msg').textContent = v instanceof Err ? v.c+' – '+ERR_MSG[v.c] : '';
+}
+function setCell(k,raw){
+  raw=raw.trim();
+  if(raw==='') delete cells[k]; else cells[k]=raw;
+  cache.clear();                        // ricalcolo: la cache si svuota e solo le celle visibili vengono ricalcolate
+  try{ localStorage.setItem('minisheet',JSON.stringify(cells)); }catch(e){}
+}
+function ensureVisible(){
+  const t=sel[0]*H, l=sel[1]*W;
+  if(t<sc.scrollTop) sc.scrollTop=t; else if(t+H>sc.scrollTop+sc.clientHeight) sc.scrollTop=t+H-sc.clientHeight;
+  if(l<sc.scrollLeft) sc.scrollLeft=l; else if(l+W>sc.scrollLeft+sc.clientWidth) sc.scrollLeft=l+W-sc.clientWidth;
+}
+function moveTo(r,c){ sel=[Math.max(0,Math.min(ROWS-1,r)),Math.max(0,Math.min(COLS-1,c))]; ensureVisible(); updateBar(); render(); }
+
+function startEdit(initial){
+  editing=true; const [r,c]=sel;
+  Object.assign(ed.style,{display:'block',left:c*W+'px',top:r*H+'px',width:Math.max(W,140)+'px',height:H+'px'});
+  ed.value = initial!==undefined ? initial : (cells[key(r,c)]||''); ed.focus();
+}
+function endEdit(commit){
+  if(!editing) return; editing=false;
+  if(commit) setCell(key(...sel),ed.value);
+  ed.style.display='none'; sc.focus();
+}
+
+// Tastiera: frecce, Tab, Invio, PagSu/PagGiù, Canc, digitazione diretta
+sc.addEventListener('keydown',e=>{
+  const [r,c]=sel;
+  if(e.target===ed){
+    if(e.key==='Enter'){ e.preventDefault(); endEdit(true); moveTo(r+1,c); }
+    else if(e.key==='Tab'){ e.preventDefault(); endEdit(true); moveTo(r,c+(e.shiftKey?-1:1)); }
+    else if(e.key==='Escape'){ endEdit(false); }
+    return;
+  }
+  const rows=Math.floor(sc.clientHeight/H)-1;
+  const nav={ArrowUp:[r-1,c],ArrowDown:[r+1,c],ArrowLeft:[r,c-1],ArrowRight:[r,c+1],PageUp:[r-rows,c],PageDown:[r+rows,c],Tab:[r,c+(e.shiftKey?-1:1)]};
+  if(nav[e.key]){ e.preventDefault(); moveTo(...nav[e.key]); }
+  else if(e.key==='Enter'||e.key==='F2'){ e.preventDefault(); startEdit(); }
+  else if(e.key==='Delete'||e.key==='Backspace'){ setCell(key(r,c),''); updateBar(); render(); }
+  else if(e.key.length===1 && !e.ctrlKey && !e.metaKey){ e.preventDefault(); startEdit(e.key); }
+});
+ed.addEventListener('blur',()=>{ if(editing){ endEdit(true); updateBar(); render(); } });
+cellsEl.addEventListener('mousedown',e=>{
+  const d=e.target.closest('.c'); if(!d) return;
+  e.preventDefault(); if(editing) endEdit(true);
+  sel=[+d.dataset.r,+d.dataset.c]; updateBar(); render(); sc.focus();
+});
+cellsEl.addEventListener('dblclick',e=>{ if(e.target.closest('.c')) startEdit(); });
+fx.addEventListener('keydown',e=>{
+  if(e.key==='Enter'){ setCell(key(...sel),fx.value); updateBar(); render(); sc.focus(); }
+});
+
+// Esempi = casi di test della prova
+$('demo').onclick=()=>{
+  Object.assign(cells,{A1:'5',A2:'10',A3:'=SOMMA(A1:A2)',A5:'7',A6:'3',A7:'ciao',
+    B1:'0',B2:'=A1/B1',C1:'=C1',D1:'=CONTA.SE(A1:A10;">5")',D2:'=SOMMA.SE(A1:A10;">5")',D3:'=MEDIA.SE(A1:A10;">5")',
+    D4:'=MEDIA(A1:A6)',D5:'=MAX(A1:A6)',D6:'=MIN(A1:A6)',D7:'=CONTA(A1:A7)',D8:'=CONTA.VALORI(A1:A7)',
+    F1:'=(A1+A2)*2',F2:'=XYZ(1)',F3:'=Z999'});
+  cache.clear(); updateBar(); render();
+};
+$('clear').onclick=()=>{ if(confirm('Svuotare tutto il foglio?')){ cells={}; cache.clear(); try{localStorage.removeItem('minisheet');}catch(e){} updateBar(); render(); } };
+
+/* ============ 4. PWA ============ */
+// Manifest generato da JavaScript (così restiamo in un solo file HTML)
+function icon(size){
+  const c=document.createElement('canvas'); c.width=c.height=size; const x=c.getContext('2d');
+  x.fillStyle='#198754'; x.fillRect(0,0,size,size); x.fillStyle='#fff';
+  x.font=`bold ${size*0.5}px sans-serif`; x.textAlign='center'; x.textBaseline='middle'; x.fillText('Σ',size/2,size/2);
+  return c.toDataURL('image/png');
+}
+try{
+  const base=new URL('./',location.href).href;
+  const manifest={name:'Mini-Foglio di Calcolo',short_name:'MiniSheet',start_url:base,scope:base,display:'standalone',
+    theme_color:'#198754',background_color:'#ffffff',
+    icons:[{src:icon(192),sizes:'192x192',type:'image/png'},{src:icon(512),sizes:'512x512',type:'image/png'}]};
+  const l=document.createElement('link'); l.rel='manifest';
+  l.href=URL.createObjectURL(new Blob([JSON.stringify(manifest)],{type:'application/manifest+json'}));
+  document.head.appendChild(l);
+}catch(e){}
+// Service worker (file sw.js accanto a index.html): percorso RELATIVO per GitHub Pages
+if('serviceWorker' in navigator && location.protocol!=='file:') navigator.serviceWorker.register('./sw.js').catch(()=>{});
+let deferred; window.addEventListener('beforeinstallprompt',e=>{ e.preventDefault(); deferred=e; $('inst').style.display='inline-block'; });
+$('inst').onclick=()=>{ if(deferred){ deferred.prompt(); deferred=null; $('inst').style.display='none'; } };
+
+/* ============ AVVIO ============ */
+try{ cells=JSON.parse(localStorage.getItem('minisheet')||'{}'); }catch(e){ cells={}; }
+updateBar(); render(); sc.focus();
+</script>
+</body>
+</html>
